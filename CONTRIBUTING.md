@@ -51,3 +51,5 @@ https://www.eclipse.org/projects/handbook/#resources-commit
 Contact the project developers via Github discussions
 
 * https://github.com/eclipse-pde/eclipse.pde/discussions
+
+<!-- Some change -->
