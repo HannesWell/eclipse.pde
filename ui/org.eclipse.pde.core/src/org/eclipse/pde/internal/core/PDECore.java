@@ -69,6 +69,8 @@ import aQute.bnd.service.clipboard.Clipboard;
 
 public class PDECore extends Plugin implements DebugOptionsListener {
 
+	// Dummy change
+
 	public static final String PLUGIN_ID = "org.eclipse.pde.core"; //$NON-NLS-1$
 
 	public static final IPath REQUIRED_PLUGINS_CONTAINER_PATH = IPath.fromOSString(PLUGIN_ID + ".requiredPlugins"); //$NON-NLS-1$
