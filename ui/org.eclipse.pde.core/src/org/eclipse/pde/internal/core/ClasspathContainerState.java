@@ -25,9 +25,9 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
@@ -110,7 +110,7 @@ public class ClasspathContainerState {
 			SubMonitor monitor = SubMonitor.convert(jobMonitor, PDECoreMessages.PluginModelManager_1, 100);
 			PluginModelManager.getInstance().initialize(monitor.split(1));
 			PluginModelManager modelManager = PluginModelManager.getInstance();
-			Map<IJavaProject, IClasspathContainer> updateProjects = new ConcurrentHashMap<>();
+			Map<IJavaProject, IClasspathContainer> updateProjects = Collections.synchronizedMap(new LinkedHashMap<>());
 			Map<IProject, IStatus> errorsPerProject = Collections.synchronizedMap(new LinkedHashMap<>());
 
 			List<UpdateRequest> requests = drainRequests(workQueue);
@@ -143,7 +143,7 @@ public class ClasspathContainerState {
 					}
 				}
 			};
-			computePluginClasspaths(requests, classpathComputation, monitor.split(count));
+			computeAllPluginClasspaths(requests, classpathComputation, monitor.split(count));
 			traceRuntime("Computed classpath of %2$d project(s) in %1$d ms.", computeNanos, count); //$NON-NLS-1$
 			if (monitor.isCanceled()) {
 				return Status.CANCEL_STATUS;
@@ -154,6 +154,7 @@ public class ClasspathContainerState {
 							"UpdateClasspathsJob finished, but no project needs an update!"); //$NON-NLS-1$
 				}
 			} else {
+				int i = 0;
 				int n = updateProjects.size();
 				if (PDECore.DEBUG_STATE) {
 					PDECore.TRACE.trace(PDECore.KEY_DEBUG_STATE, String
@@ -162,8 +163,7 @@ public class ClasspathContainerState {
 				}
 				IJavaProject[] javaProjects = new IJavaProject[n];
 				IClasspathContainer[] container = new IClasspathContainer[n];
-				int i = 0;
-				for (var entry : updateProjects.entrySet()) {
+				for (Entry<IJavaProject, IClasspathContainer> entry : updateProjects.entrySet()) {
 					javaProjects[i] = entry.getKey();
 					container[i] = entry.getValue();
 					i++;
@@ -197,7 +197,7 @@ public class ClasspathContainerState {
 			return overallStatus;
 		}
 
-		private void computePluginClasspaths(List<UpdateRequest> requests,
+		private void computeAllPluginClasspaths(List<UpdateRequest> requests,
 				BiConsumer<UpdateRequest, IProgressMonitor> classpathComputation, IProgressMonitor progressMonitor) {
 			int count = requests.size();
 			SubMonitor monitor = SubMonitor.convert(progressMonitor, count);
@@ -217,16 +217,11 @@ public class ClasspathContainerState {
 			// sequentially here while the group runs. Workers never touch the
 			// shared monitor (SubMonitor is not thread-safe); progress is
 			// reported from this thread and by JobGroup.join.
-			List<UpdateRequest> bndProjects = new ArrayList<>();
 			List<Job> jobs = new ArrayList<>();
 			for (UpdateRequest request : requests) {
-				if (BndProject.isBndProject(request.project())) {
-					bndProjects.add(request);
-				} else {
-					jobs.add(Job.create(PDECoreMessages.PluginModelManager_1, m -> {
-						classpathComputation.accept(request, m);
-					}));
-				}
+				jobs.add(Job.create(PDECoreMessages.PluginModelManager_1, m -> {
+					classpathComputation.accept(request, m);
+				}));
 			}
 			int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
 			JobGroup group = new JobGroup("PDE Classpath Update", maxThreads, jobs.size()); //$NON-NLS-1$
@@ -234,9 +229,6 @@ public class ClasspathContainerState {
 				job.setSystem(true);
 				job.setJobGroup(group);
 				job.schedule();
-			}
-			for (UpdateRequest request : bndProjects) {
-				classpathComputation.accept(request, monitor.split(1));
 			}
 			try {
 				group.join(0, monitor.split(jobs.size()));
@@ -276,8 +268,12 @@ public class ClasspathContainerState {
 	}
 
 	/**
-	 * Drains the queue, keeping one request per project. A request without a
-	 * saved container forces an update and so wins over a skippable one.
+	 * Drains the given queue and deduplicates requests for the same project.
+	 * Multiple requests for one project are queued e.g. when a target platform
+	 * reload triggers classpath updates from several listeners. A request
+	 * without a saved container state forces a container update and therefore
+	 * wins over requests whose update may be skipped when the computed entries
+	 * match the saved state.
 	 */
 	public static List<UpdateRequest> drainRequests(Queue<UpdateRequest> queue) {
 		Map<IProject, UpdateRequest> requests = new LinkedHashMap<>();
