@@ -19,14 +19,17 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IProject;
@@ -41,6 +44,7 @@ import org.eclipse.core.runtime.MultiStatus;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.core.runtime.jobs.Job;
+import org.eclipse.core.runtime.jobs.JobGroup;
 import org.eclipse.jdt.core.IClasspathContainer;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.IJavaProject;
@@ -106,23 +110,20 @@ public class ClasspathContainerState {
 			SubMonitor monitor = SubMonitor.convert(jobMonitor, PDECoreMessages.PluginModelManager_1, 100);
 			PluginModelManager.getInstance().initialize(monitor.split(1));
 			PluginModelManager modelManager = PluginModelManager.getInstance();
-			Map<IJavaProject, IClasspathContainer> updateProjects = new LinkedHashMap<>();
-			Map<IProject, IStatus> errorsPerProject = new LinkedHashMap<>();
+			Map<IJavaProject, IClasspathContainer> updateProjects = new ConcurrentHashMap<>();
+			Map<IProject, IStatus> errorsPerProject = Collections.synchronizedMap(new LinkedHashMap<>());
 
 			List<UpdateRequest> requests = drainRequests(workQueue);
 			int count = requests.size();
 			monitor.setWorkRemaining(count * 2);
 
 			long computeNanos = PDECore.DEBUG_CLASSPATH ? System.nanoTime() : 0;
-			String messageTemplate = PDECoreMessages.PluginModelManager_1 + " ({0}/{1}): {2}"; //$NON-NLS-1$
-			for (int i = 0; i < requests.size(); i++) {
-				UpdateRequest req = requests.get(i);
-				if (monitor.isCanceled()) {
-					break;
+			BiConsumer<UpdateRequest, IProgressMonitor> classpathComputation = (req, updateMonitor) -> {
+				if (updateMonitor.isCanceled()) {
+					return;
 				}
 				IProject project = req.project();
 				if (project.exists() && project.isOpen()) {
-					monitor.setTaskName(NLS.bind(messageTemplate, i + 1, count, project.getName()));
 					IPluginModelBase model = modelManager.findModel(project);
 					if (isPdeContainerProject(project, model) && PluginProject.isJavaProject(project)) {
 						IJavaProject javaProject = JavaCore.create(project);
@@ -131,16 +132,18 @@ public class ClasspathContainerState {
 									javaProject.getProject());
 							if (!isUpToDate(project, entries, req.container())) {
 								updateProjects.put(javaProject, PDEClasspathContainerSaveHelper.containerOf(entries));
-								errorsPerProject.remove(project);
 								saveState(project, entries);
 							}
 						} catch (CoreException e) {
 							errorsPerProject.put(project, e.getStatus());
+						} catch (RuntimeException e) {
+							PDECore.log(e);
+							errorsPerProject.put(project, Status.error(PDECoreMessages.ClasspathComputer_failed, e));
 						}
 					}
 				}
-				monitor.worked(1);
-			}
+			};
+			computePluginClasspaths(requests, classpathComputation, monitor.split(count));
 			traceRuntime("Computed classpath of %2$d project(s) in %1$d ms.", computeNanos, count); //$NON-NLS-1$
 			if (monitor.isCanceled()) {
 				return Status.CANCEL_STATUS;
@@ -151,7 +154,6 @@ public class ClasspathContainerState {
 							"UpdateClasspathsJob finished, but no project needs an update!"); //$NON-NLS-1$
 				}
 			} else {
-				int i = 0;
 				int n = updateProjects.size();
 				if (PDECore.DEBUG_STATE) {
 					PDECore.TRACE.trace(PDECore.KEY_DEBUG_STATE, String
@@ -160,12 +162,14 @@ public class ClasspathContainerState {
 				}
 				IJavaProject[] javaProjects = new IJavaProject[n];
 				IClasspathContainer[] container = new IClasspathContainer[n];
-				for (Entry<IJavaProject, IClasspathContainer> entry : updateProjects.entrySet()) {
+				int i = 0;
+				for (var entry : updateProjects.entrySet()) {
 					javaProjects[i] = entry.getKey();
 					container[i] = entry.getValue();
 					i++;
 				}
 				try {
+					monitor.setTaskName(NLS.bind(PDECoreMessages.ClasspathContainerState_applying, n));
 					monitor.setWorkRemaining(n);
 					long applyNanos = PDECore.DEBUG_CLASSPATH ? System.nanoTime() : 0;
 					setProjectContainers(javaProjects, container, monitor.split(n));
@@ -174,6 +178,8 @@ public class ClasspathContainerState {
 					return e.getStatus();
 				}
 			}
+			// Reach 100 % even when nothing needed to be applied.
+			monitor.setWorkRemaining(0);
 			traceRuntime("UpdateClasspathsJob finished in %d ms: %d request(s), %d updated, %d error(s).", startNanos, //$NON-NLS-1$
 					count, updateProjects.size(), errorsPerProject.size());
 			IStatus[] errors = errorsPerProject.values().toArray(IStatus[]::new);
@@ -189,6 +195,56 @@ public class ClasspathContainerState {
 				overallStatus.add(status);
 			}
 			return overallStatus;
+		}
+
+		private void computePluginClasspaths(List<UpdateRequest> requests,
+				BiConsumer<UpdateRequest, IProgressMonitor> classpathComputation, IProgressMonitor progressMonitor) {
+			int count = requests.size();
+			SubMonitor monitor = SubMonitor.convert(progressMonitor, count);
+			// Each project's computation only reads shared state, so it can run
+			// in parallel; results are applied afterwards in one batched call.
+			boolean parallel = PDECore.getDefault().getPreferencesManager()
+					.getBoolean(ICoreConstants.UPDATE_CLASSPATH_IN_PARALLEL);
+			if (!parallel) {
+				int done = 0;
+				for (UpdateRequest request : requests) {
+					monitor.setTaskName(NLS.bind(PDECoreMessages.ClasspathContainerState_computing, ++done, count));
+					classpathComputation.accept(request, monitor.split(1));
+				}
+				return;
+			}
+			// bnd projects share one non-thread-safe bnd workspace, so they run
+			// sequentially here while the group runs. Workers never touch the
+			// shared monitor (SubMonitor is not thread-safe); progress is
+			// reported from this thread and by JobGroup.join.
+			List<UpdateRequest> bndProjects = new ArrayList<>();
+			List<Job> jobs = new ArrayList<>();
+			for (UpdateRequest request : requests) {
+				if (BndProject.isBndProject(request.project())) {
+					bndProjects.add(request);
+				} else {
+					jobs.add(Job.create(PDECoreMessages.PluginModelManager_1, m -> {
+						classpathComputation.accept(request, m);
+					}));
+				}
+			}
+			int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+			JobGroup group = new JobGroup("PDE Classpath Update", maxThreads, jobs.size()); //$NON-NLS-1$
+			for (Job job : jobs) {
+				job.setSystem(true);
+				job.setJobGroup(group);
+				job.schedule();
+			}
+			for (UpdateRequest request : bndProjects) {
+				classpathComputation.accept(request, monitor.split(1));
+			}
+			try {
+				group.join(0, monitor.split(jobs.size()));
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				group.cancel();
+				monitor.setCanceled(true);
+			}
 		}
 
 		/**
@@ -220,12 +276,8 @@ public class ClasspathContainerState {
 	}
 
 	/**
-	 * Drains the given queue and deduplicates requests for the same project.
-	 * Multiple requests for one project are queued e.g. when a target platform
-	 * reload triggers classpath updates from several listeners. A request
-	 * without a saved container state forces a container update and therefore
-	 * wins over requests whose update may be skipped when the computed entries
-	 * match the saved state.
+	 * Drains the queue, keeping one request per project. A request without a
+	 * saved container forces an update and so wins over a skippable one.
 	 */
 	public static List<UpdateRequest> drainRequests(Queue<UpdateRequest> queue) {
 		Map<IProject, UpdateRequest> requests = new LinkedHashMap<>();
@@ -356,6 +408,5 @@ public class ClasspathContainerState {
 	}
 
 	public static record UpdateRequest(IProject project, IClasspathContainer container) {
-
 	}
 }
