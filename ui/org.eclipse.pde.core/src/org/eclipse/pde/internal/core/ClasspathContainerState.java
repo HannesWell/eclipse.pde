@@ -29,6 +29,7 @@ import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 
@@ -118,10 +119,16 @@ public class ClasspathContainerState {
 			monitor.setWorkRemaining(count * 2);
 
 			long computeNanos = PDECore.DEBUG_CLASSPATH ? System.nanoTime() : 0;
+			AtomicInteger projectsCompleted = new AtomicInteger(0);
 			BiConsumer<UpdateRequest, IProgressMonitor> classpathComputation = (req, updateMonitor) -> {
 				if (updateMonitor.isCanceled()) {
 					return;
 				}
+				synchronized (monitor) {
+					monitor.setTaskName(NLS.bind(PDECoreMessages.ClasspathContainerState_computing,
+							projectsCompleted.getAndIncrement() + 1, count));
+				}
+				updateMonitor.beginTask(PDECoreMessages.PluginModelManager_1, 2);
 				IProject project = req.project();
 				if (project.exists() && project.isOpen()) {
 					IPluginModelBase model = modelManager.findModel(project);
@@ -130,9 +137,12 @@ public class ClasspathContainerState {
 						try {
 							IClasspathEntry[] entries = ClasspathComputer.computeClasspathEntries(model,
 									javaProject.getProject());
+							updateMonitor.worked(1);
 							if (!isUpToDate(project, entries, req.container())) {
 								updateProjects.put(javaProject, PDEClasspathContainerSaveHelper.containerOf(entries));
 								saveState(project, entries);
+							} else {
+								updateMonitor.worked(1);
 							}
 						} catch (CoreException e) {
 							errorsPerProject.put(project, e.getStatus());
@@ -143,7 +153,7 @@ public class ClasspathContainerState {
 					}
 				}
 			};
-			computeAllPluginClasspaths(requests, classpathComputation, monitor.split(count));
+			computeAllPluginClasspaths(requests, classpathComputation, monitor);
 			traceRuntime("Computed classpath of %2$d project(s) in %1$d ms.", computeNanos, count); //$NON-NLS-1$
 			if (monitor.isCanceled()) {
 				return Status.CANCEL_STATUS;
@@ -179,7 +189,7 @@ public class ClasspathContainerState {
 				}
 			}
 			// Reach 100 % even when nothing needed to be applied.
-			monitor.setWorkRemaining(0);
+			monitor.done();
 			traceRuntime("UpdateClasspathsJob finished in %d ms: %d request(s), %d updated, %d error(s).", startNanos, //$NON-NLS-1$
 					count, updateProjects.size(), errorsPerProject.size());
 			IStatus[] errors = errorsPerProject.values().toArray(IStatus[]::new);
@@ -200,16 +210,14 @@ public class ClasspathContainerState {
 		private void computeAllPluginClasspaths(List<UpdateRequest> requests,
 				BiConsumer<UpdateRequest, IProgressMonitor> classpathComputation, IProgressMonitor progressMonitor) {
 			int count = requests.size();
-			SubMonitor monitor = SubMonitor.convert(progressMonitor, count);
+			SubMonitor monitor = SubMonitor.convert(progressMonitor, count * 2);
 			// Each project's computation only reads shared state, so it can run
 			// in parallel; results are applied afterwards in one batched call.
 			boolean parallel = PDECore.getDefault().getPreferencesManager()
 					.getBoolean(ICoreConstants.UPDATE_CLASSPATH_IN_PARALLEL);
 			if (!parallel) {
-				int done = 0;
 				for (UpdateRequest request : requests) {
-					monitor.setTaskName(NLS.bind(PDECoreMessages.ClasspathContainerState_computing, ++done, count));
-					classpathComputation.accept(request, monitor.split(1));
+					classpathComputation.accept(request, monitor);
 				}
 				return;
 			}
@@ -219,8 +227,9 @@ public class ClasspathContainerState {
 			// reported from this thread and by JobGroup.join.
 			List<Job> jobs = new ArrayList<>();
 			for (UpdateRequest request : requests) {
+				IProgressMonitor computationMonitor = monitor.slice(2);
 				jobs.add(Job.create(PDECoreMessages.PluginModelManager_1, m -> {
-					classpathComputation.accept(request, m);
+					classpathComputation.accept(request, computationMonitor);
 				}));
 			}
 			int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
@@ -231,7 +240,8 @@ public class ClasspathContainerState {
 				job.schedule();
 			}
 			try {
-				group.join(0, monitor.split(jobs.size()));
+				// pass zero-monitor only for cancellation monitoring
+				group.join(0, monitor.split(0, SubMonitor.SUPPRESS_SUBTASK));
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				group.cancel();
