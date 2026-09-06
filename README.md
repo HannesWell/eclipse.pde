@@ -1,6 +1,8 @@
 Eclipse PDE - Plug-in Development Environment
 =====================================================
 
+<!-- Dummy change -->
+
 Thanks for your interest in this project.
 
 Project description:
